@@ -1,0 +1,3 @@
+OPENAI_API_KEY=your-openai-key-here
+DEEPSEEK_API_KEY=your-deepseek-key-here
+CONTEXT=Describe yourself here — role, tools, project names, tech stack. Used to improve transcription accuracy.

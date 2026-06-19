@@ -1,0 +1,9 @@
+# Voice input corrections — one per line, format: wrong -> right
+# Case-insensitive matching, applied after AI cleanup
+# Examples (edit these to match your actual pain points):
+rumba -> rumbo
+tail scale -> Tailscale
+tailscale -> Tailscale
+end of our OS -> EndeavourOS
+endeavor OS -> EndeavourOS
+postgres -> PostgreSQL

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Browse/copy past voice transcriptions and manage settings via rofi."""
+import subprocess
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+
+NOTES_DIR = Path.home() / "Documents/voice-notes"
+CONFIG_FILE = Path.home() / ".config/voice-input/config"
+CORRECTIONS_FILE = Path.home() / ".config/voice-input/corrections.txt"
+DAYS_BACK = 7
+
+ROFI_THEME = "listview { lines: 12; } window { width: 70%; }"
+
+
+def rofi(prompt, items, mesg=""):
+    args = ["rofi", "-dmenu", "-i", "-p", prompt, "-format", "i",
+            "-kb-custom-1", "Alt+Return",
+            "-theme-str", ROFI_THEME]
+    if mesg:
+        args += ["-mesg", mesg]
+    result = subprocess.run(args, input="\n".join(items).encode(), capture_output=True)
+    if not result.stdout.strip():
+        return None, None
+    return int(result.stdout.strip()), result.returncode
+
+
+def rofi_input(prompt, placeholder=""):
+    result = subprocess.run(
+        ["rofi", "-dmenu", "-p", prompt, "-theme-str", ROFI_THEME],
+        input=placeholder.encode(),
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode().strip()
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "-t", "2000", "Voice Input", msg])
+
+
+def copy_to_clipboard(text):
+    proc = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
+    proc.communicate(text.encode())
+
+
+def type_into_window(text):
+    subprocess.run(["xdotool", "type", "--clearmodifiers", "--", text])
+
+
+def load_entries():
+    entries = []
+    for i in range(DAYS_BACK):
+        date = datetime.now().date() - timedelta(days=i)
+        note_file = NOTES_DIR / f"{date}.md"
+        if not note_file.exists():
+            continue
+        label = "Today" if i == 0 else date.strftime("%a %d %b")
+        current_time, current_text = None, []
+        for line in note_file.read_text().splitlines():
+            if line.startswith("## "):
+                if current_text:
+                    entries.append((f"[{label} {current_time}]  {'  '.join(current_text)}", "\n".join(current_text)))
+                current_time = line[3:].strip()
+                current_text = []
+            elif line.strip():
+                current_text.append(line.strip())
+        if current_text:
+            entries.append((f"[{label} {current_time}]  {'  '.join(current_text)}", "\n".join(current_text)))
+    return list(reversed(entries))
+
+
+def load_config():
+    config = {}
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                config[k.strip()] = v.strip()
+    return config
+
+
+def save_config_value(key, value):
+    text = CONFIG_FILE.read_text()
+    if re.search(rf"^{key}=", text, re.MULTILINE):
+        text = re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.MULTILINE)
+    else:
+        text += f"\n{key}={value}\n"
+    CONFIG_FILE.write_text(text)
+
+
+# --- Settings actions ---
+
+def setting_add_correction():
+    value = rofi_input("Add correction (wrong -> right)")
+    if not value or "->" not in value:
+        return
+    with open(CORRECTIONS_FILE, "a") as f:
+        f.write(f"{value}\n")
+    notify(f"Added: {value}")
+
+
+def setting_edit_context():
+    config = load_config()
+    current = config.get("CONTEXT", "")
+    new_val = rofi_input("Edit context", current)
+    if new_val is None:
+        return
+    save_config_value("CONTEXT", new_val)
+    notify("Context updated.")
+
+
+def setting_view_corrections():
+    if not CORRECTIONS_FILE.exists():
+        notify("No corrections file found.")
+        return
+    lines = [l for l in CORRECTIONS_FILE.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    if not lines:
+        notify("No corrections defined yet.")
+        return
+    idx, _ = rofi("Delete correction? (Esc to cancel)", lines)
+    if idx is None:
+        return
+    lines.pop(idx)
+    header = "# Voice input corrections — one per line, format: wrong -> right\n"
+    CORRECTIONS_FILE.write_text(header + "\n".join(lines) + "\n")
+    notify("Correction removed.")
+
+
+def setting_clear_today():
+    note_file = NOTES_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+    if not note_file.exists():
+        notify("No notes for today.")
+        return
+    confirm = rofi_input("Type YES to clear today's notes")
+    if confirm == "YES":
+        note_file.unlink()
+        notify("Today's notes cleared.")
+
+
+def main():
+    entries = load_entries()
+
+    # Build menu: settings at top, then separator, then transcriptions
+    settings_items = [
+        "  ⏺  Start long recording (up to 10 min)",
+        "  + Add correction",
+        "  Edit context",
+        "  View / remove corrections",
+        "  Clear today's notes",
+        "─────────────────────────────",
+    ]
+    labels = [label for label, _ in entries]
+    all_items = settings_items + labels
+    mesg = "Enter: copy  |  Alt+Enter: type into window"
+
+    idx, returncode = rofi("Voice Input", all_items, mesg=mesg)
+    if idx is None:
+        return
+
+    n_settings = len(settings_items)
+
+    if idx < n_settings - 1:  # settings actions (exclude separator)
+        actions = [
+            lambda: subprocess.Popen(["voice-input", "long"]),
+            setting_add_correction,
+            setting_edit_context,
+            setting_view_corrections,
+            setting_clear_today,
+        ]
+        actions[idx]()
+    elif idx == n_settings - 1:
+        pass  # separator
+    else:
+        entry_idx = idx - n_settings
+        _, text = entries[entry_idx]
+        if returncode == 10:  # Alt+Enter
+            type_into_window(text)
+            notify("Typed into window.")
+        else:
+            copy_to_clipboard(text)
+            notify("Copied to clipboard.")
+
+
+if __name__ == "__main__":
+    main()
