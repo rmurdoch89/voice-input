@@ -1,3 +1,15 @@
+# Transcription provider: openai or deepgram
+TRANSCRIPTION_PROVIDER=openai
+
+# API keys — provide the one that matches your chosen provider
 OPENAI_API_KEY=your-openai-key-here
+DEEPGRAM_API_KEY=your-deepgram-key-here
+
+# Optional: AI cleanup of grammar and punctuation
 DEEPSEEK_API_KEY=your-deepseek-key-here
+
+# Context used to improve transcription accuracy and guide cleanup
 CONTEXT=Describe yourself here — role, tools, project names, tech stack. Used to improve transcription accuracy.
+
+# Optional: language hint, e.g. en, fr, de, ja (blank = auto-detect)
+LANGUAGE=

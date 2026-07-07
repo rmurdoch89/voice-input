@@ -132,7 +132,8 @@ DEFAULT_TEMPLATES = [
 ]
 
 def load_config():
-    cfg = {"OPENAI_API_KEY": "", "DEEPSEEK_API_KEY": "", "CONTEXT": "",
+    cfg = {"TRANSCRIPTION_PROVIDER": "openai", "OPENAI_API_KEY": "",
+           "DEEPGRAM_API_KEY": "", "DEEPSEEK_API_KEY": "", "CONTEXT": "",
            "LANGUAGE": "", "AUDIO_DEVICE": "", "PASTE_MODE": "auto"}
     if CONFIG_FILE.exists():
         for line in CONFIG_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -355,7 +356,7 @@ def audio_to_wav(audio_int16):
 
 _TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0)
 
-def api_transcribe(api_key, wav_bytes, prompt="", language=""):
+def api_transcribe_openai(api_key, wav_bytes, prompt="", language=""):
     data = {"model": "gpt-4o-mini-transcribe", "response_format": "text"}
     if prompt:   data["prompt"]   = prompt
     if language: data["language"] = language
@@ -369,6 +370,31 @@ def api_transcribe(api_key, wav_bytes, prompt="", language=""):
         if resp.status_code != 200:
             raise RuntimeError(f"Whisper {resp.status_code}: {resp.text[:120]}")
         return resp.text.strip()
+
+
+def api_transcribe_deepgram(api_key, wav_bytes, language="", keywords=None):
+    params = {"model": "nova-2", "diarize": "false", "smart_format": "true"}
+    if language:
+        params["language"] = language
+    query = "&".join(f"{k}={httpx.URL.encode_value(str(v))}" for k, v in params.items())
+    if keywords:
+        kw_query = "&".join(f"keywords={httpx.URL.encode_value(k)}" for k in keywords)
+        query = f"{kw_query}&{query}"
+    with httpx.Client(timeout=_TIMEOUT) as client:
+        resp = client.post(
+            f"https://api.deepgram.com/v1/listen?{query}",
+            headers={"Authorization": f"Token {api_key}", "Content-Type": "audio/wav"},
+            content=wav_bytes,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Deepgram {resp.status_code}: {resp.text[:120]}")
+        return resp.json()["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
+
+
+def api_transcribe(provider, api_key, wav_bytes, prompt="", language="", keywords=None):
+    if provider == "deepgram":
+        return api_transcribe_deepgram(api_key, wav_bytes, language=language, keywords=keywords)
+    return api_transcribe_openai(api_key, wav_bytes, prompt=prompt, language=language)
 
 def api_cleanup(api_key, text, context=""):
     system = (
@@ -764,9 +790,28 @@ class SettingsDialog(DarkDialog):
 
         # API Keys
         lay.addWidget(self._section("API Keys"))
+
+        lay.addWidget(self._label("Transcription provider"))
+        self.provider = QComboBox()
+        self.provider.addItem("OpenAI Whisper", "openai")
+        self.provider.addItem("Deepgram", "deepgram")
+        current_provider = cfg.get("TRANSCRIPTION_PROVIDER", "openai").lower().strip()
+        for i in range(self.provider.count()):
+            if self.provider.itemData(i) == current_provider:
+                self.provider.setCurrentIndex(i)
+                break
+        lay.addWidget(self.provider)
+        lay.addSpacing(6)
+
         lay.addWidget(self._label("OpenAI API Key"))
         self.openai = self._field(cfg.get("OPENAI_API_KEY", ""), "sk-…", password=True)
         lay.addWidget(self.openai)
+        lay.addSpacing(6)
+
+        lay.addWidget(self._label("Deepgram API Key"))
+        lay.addWidget(self._hint("Required when provider is Deepgram"))
+        self.deepgram = self._field(cfg.get("DEEPGRAM_API_KEY", ""), "", password=True)
+        lay.addWidget(self.deepgram)
         lay.addSpacing(6)
 
         lay.addWidget(self._label("DeepSeek API Key"))
@@ -930,12 +975,14 @@ class SettingsDialog(DarkDialog):
 
     def _do_save(self):
         cfg = {
-            "OPENAI_API_KEY":  self.openai.text().strip(),
-            "DEEPSEEK_API_KEY": self.deepseek.text().strip(),
-            "CONTEXT":         self.context.text().strip(),
-            "LANGUAGE":        self.language.text().strip(),
-            "AUDIO_DEVICE":    self.mic_combo.currentData() or "",
-            "PASTE_MODE":      "auto",
+            "TRANSCRIPTION_PROVIDER": self.provider.currentData() or "openai",
+            "OPENAI_API_KEY":         self.openai.text().strip(),
+            "DEEPGRAM_API_KEY":       self.deepgram.text().strip(),
+            "DEEPSEEK_API_KEY":       self.deepseek.text().strip(),
+            "CONTEXT":                self.context.text().strip(),
+            "LANGUAGE":               self.language.text().strip(),
+            "AUDIO_DEVICE":           self.mic_combo.currentData() or "",
+            "PASTE_MODE":             "auto",
         }
         if CONFIG_FILE.exists():
             for line in CONFIG_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -1261,15 +1308,24 @@ class TrayApp(QApplication):
             wav   = audio_to_wav(audio)
             cfg   = load_config()
             corr  = load_corrections()
-            key   = cfg.get("OPENAI_API_KEY", "")
+            provider = cfg.get("TRANSCRIPTION_PROVIDER", "openai").lower().strip()
+            if provider == "deepgram":
+                key = cfg.get("DEEPGRAM_API_KEY", "")
+                prompt = ""
+                keywords = [r for _, r in corr[:20]]
+            else:
+                key = cfg.get("OPENAI_API_KEY", "")
+                prompt = build_whisper_prompt(corr)
+                keywords = None
             if not key:
-                log("missing OpenAI key")
+                log(f"missing {provider} key")
                 self._sig_error.emit()
                 return
-            log("calling Whisper…")
-            raw = api_transcribe(key, wav,
-                                 build_whisper_prompt(corr),
-                                 cfg.get("LANGUAGE", ""))
+            log(f"calling {provider}…")
+            raw = api_transcribe(provider, key, wav,
+                                 prompt=prompt,
+                                 language=cfg.get("LANGUAGE", ""),
+                                 keywords=keywords)
             log(f"transcript: {raw[:80]!r}")
             if not raw:
                 log("empty transcript — wrong mic, or no speech detected")

@@ -79,10 +79,17 @@ pip install --user --break-system-packages openai requests
 
 `~/.config/voice-input/config`:
 ```
+# Transcription provider: openai or deepgram
+TRANSCRIPTION_PROVIDER=openai
+
 OPENAI_API_KEY=sk-...
+DEEPGRAM_API_KEY=...
 DEEPSEEK_API_KEY=sk-...
 CONTEXT=Australian software developer. Works on a project called "rumbo"...
+LANGUAGE=en
 ```
+
+Set `TRANSCRIPTION_PROVIDER=deepgram` and provide `DEEPGRAM_API_KEY` to use Deepgram instead of OpenAI Whisper. Deepgram is usually faster; Whisper tends to be more accurate with strong accents or noisy audio.
 
 `~/.config/voice-input/corrections.txt` — one correction per line:
 ```
@@ -97,7 +104,7 @@ Everything Windows-specific lives under [`windows/`](windows/).
 
 1. Build or download `GoVoice-Setup.exe` (see "Building the installer" below).
 2. Run it — no admin rights needed, installs per-user to `%LocalAppData%\Programs\GoVoice`. The installer isn't code-signed, so Windows SmartScreen will show an "Unknown publisher" warning on first run — click "More info" → "Run anyway."
-3. Enter your OpenAI API key (required) and DeepSeek key (optional, for grammar cleanup) when prompted. These get written to `%APPDATA%\voice-input\config`.
+3. Enter your OpenAI or Deepgram API key (required) and DeepSeek key (optional, for grammar cleanup) when prompted. Choose the transcription provider in the Settings dialog. These get written to `%APPDATA%\voice-input\config`.
 4. Optionally tick "Start GoVoice automatically when Windows starts."
 
 A teal mic icon appears in the system tray. Right-click for the menu, or use the hotkeys below. To change API keys, context, or corrections later, use the tray icon's Settings dialog — no need to reinstall.
@@ -113,11 +120,14 @@ A teal mic icon appears in the system tray. Right-click for the menu, or use the
 1. Copy `windows/voice-input-gui.pyw` and the two `.vbs` launchers somewhere, e.g. `C:\voice-input\`.
 2. Create `%APPDATA%\voice-input\config`:
    ```
+   TRANSCRIPTION_PROVIDER=openai
    OPENAI_API_KEY=sk-your-key-here
+   DEEPGRAM_API_KEY=your-deepgram-key-here
    DEEPSEEK_API_KEY=sk-your-key-here
    CONTEXT=Describe yourself — role, tools, project names
    LANGUAGE=en
    ```
+   Set `TRANSCRIPTION_PROVIDER=deepgram` to use Deepgram instead of OpenAI Whisper.
 3. (Optional) Create `%APPDATA%\voice-input\corrections.txt` (same format as Linux, above).
 4. Double-click `voice-input-gui.vbs` (or run `pythonw.exe voice-input-gui.pyw` directly).
 

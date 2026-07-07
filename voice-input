@@ -26,7 +26,13 @@ LONG_MAX_SECONDS = 600
 
 
 def load_config():
-    config = {}
+    config = {
+        "TRANSCRIPTION_PROVIDER": "openai",
+        "OPENAI_API_KEY": "",
+        "DEEPGRAM_API_KEY": "",
+        "DEEPSEEK_API_KEY": "",
+        "CONTEXT": "",
+    }
     if CONFIG_FILE.exists():
         for line in CONFIG_FILE.read_text().splitlines():
             line = line.strip()
@@ -73,6 +79,53 @@ def build_whisper_prompt(corrections, context):
         return None
     # Whisper prompt: a natural-sounding sentence helps more than a bare list
     return "Keywords: " + ", ".join(unique_terms) + "."
+
+
+def build_deepgram_keywords(corrections, context):
+    """Build a Deepgram keywords boost list from corrections and context."""
+    terms = [right for _, right in corrections]
+    if context:
+        terms += re.findall(r'[A-Z][a-zA-Z0-9]+(?:\s[A-Z][a-zA-Z0-9]+)*', context)
+    seen = set()
+    unique_terms = [t for t in terms if not (t in seen or seen.add(t))]
+    return unique_terms
+
+
+def transcribe_openai(api_key, wav_path, prompt=None):
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    with open(wav_path, "rb") as f:
+        kwargs = dict(model="whisper-1", file=f, response_format="text")
+        if prompt:
+            kwargs["prompt"] = prompt
+        transcript = client.audio.transcriptions.create(**kwargs)
+    return transcript.strip()
+
+
+def transcribe_deepgram(api_key, wav_path, language="", keywords=None):
+    import requests
+    params = {"model": "nova-2", "diarize": "false", "smart_format": "true"}
+    if language:
+        params["language"] = language
+    url = "https://api.deepgram.com/v1/listen"
+    if keywords:
+        # Deepgram accepts repeated keywords params
+        url += "?" + "&".join(f"keywords={requests.utils.quote(k)}" for k in keywords)
+        if params:
+            url += "&" + "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
+    else:
+        url += "?" + "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
+
+    with open(wav_path, "rb") as f:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Token {api_key}", "Content-Type": "audio/wav"},
+            data=f,
+            timeout=60,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
 
 
 def start_recording():
@@ -206,28 +259,31 @@ def stop_recording():
     log("starting transcription")
     notify("Transcribing... keep focus on target window", "normal")
     config = load_config()
-    log(f"config loaded, keys present: openai={'OPENAI_API_KEY' in config} deepseek={'DEEPSEEK_API_KEY' in config}")
+    provider = config.get("TRANSCRIPTION_PROVIDER", "openai").lower().strip()
     openai_key = config.get("OPENAI_API_KEY", "")
+    deepgram_key = config.get("DEEPGRAM_API_KEY", "")
     deepseek_key = config.get("DEEPSEEK_API_KEY", "")
     context = config.get("CONTEXT", "")
+    language = config.get("LANGUAGE", "")
 
-    if not openai_key or openai_key == "your-openai-key-here":
-        notify("Missing OpenAI API key in ~/.config/voice-input/config", "critical")
-        return
+    log(f"provider={provider} openai_key_present={bool(openai_key)} deepgram_key_present={bool(deepgram_key)}")
 
     corrections = load_corrections()
-    whisper_prompt = build_whisper_prompt(corrections, context)
 
-    # Transcribe with Whisper
+    # Transcribe
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
-        with open(WAV_FILE, "rb") as f:
-            kwargs = dict(model="whisper-1", file=f, response_format="text")
-            if whisper_prompt:
-                kwargs["prompt"] = whisper_prompt
-            transcript = client.audio.transcriptions.create(**kwargs)
-        raw_text = transcript.strip()
+        if provider == "deepgram":
+            if not deepgram_key or deepgram_key == "your-deepgram-key-here":
+                notify("Missing Deepgram API key in ~/.config/voice-input/config", "critical")
+                return
+            keywords = build_deepgram_keywords(corrections, context)
+            raw_text = transcribe_deepgram(deepgram_key, WAV_FILE, language=language, keywords=keywords)
+        else:
+            if not openai_key or openai_key == "your-openai-key-here":
+                notify("Missing OpenAI API key in ~/.config/voice-input/config", "critical")
+                return
+            whisper_prompt = build_whisper_prompt(corrections, context)
+            raw_text = transcribe_openai(openai_key, WAV_FILE, prompt=whisper_prompt)
         log(f"transcript: {raw_text[:80]}")
     except Exception as e:
         log(f"transcription error: {e}")
