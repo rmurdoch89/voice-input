@@ -1,2 +1,17 @@
+# Local secrets / user data — never commit these
 config
 *.log
+corrections.txt
+templates.txt
+
+# Claude Code local project settings
+.claude/
+
+# Windows
+windows/__pycache__/
+windows/*.pyc
+windows/*.exe~
+windows/dist_build/build/
+windows/dist_build/dist/
+windows/dist_build/installer_output/
+windows/dist_build/GoVoice.spec
