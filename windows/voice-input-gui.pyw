@@ -201,6 +201,7 @@ class Recorder:
         self._thread  = None
         self._lock    = threading.Lock()
         self.level    = 0.0   # current RMS level 0.0–1.0, updated in real-time
+        self.sample_rate = SAMPLERATE   # actual rate of the last-opened stream
         self._wasapi  = self._find_wasapi_api()
 
     @staticmethod
@@ -279,14 +280,26 @@ class Recorder:
                 log(f"retrying  dev={dev}  attempt={attempt+1}")
                 time.sleep(0.25)   # let Windows Audio Session settle between attempts
             latency = 0.1 if attempt == 0 else 0.3   # higher latency on retry
+            # Open at the device's native rate and channel count — asking WASAPI
+            # to convert (48kHz mono) gives some devices stereo-interleaved-as-mono
+            # data (half-speed audio) or AUDCLNT_E_DEVICE_INVALIDATED.
             try:
-                with sd.InputStream(device=dev, samplerate=SAMPLERATE,
-                                     channels=1, dtype="int16",
+                info = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
+                rate     = int(info.get("default_samplerate") or SAMPLERATE)
+                channels = max(1, min(2, int(info.get("max_input_channels") or 1)))
+            except Exception:
+                rate, channels = SAMPLERATE, 1
+            try:
+                with sd.InputStream(device=dev, samplerate=rate,
+                                     channels=channels, dtype="int16",
                                      blocksize=self._CHUNK, latency=latency) as stream:
-                    log(f"audio stream open  device={dev}")
+                    self.sample_rate = rate
+                    log(f"audio stream open  device={dev}  rate={rate}  channels={channels}")
                     while self._running:
                         data, _ = stream.read(self._CHUNK)
-                        flat = data.flatten()
+                        # First channel only — on echo-cancelling devices the
+                        # second channel can be a far-end reference signal.
+                        flat = np.ascontiguousarray(data[:, 0])
                         with self._lock:
                             self._chunks.append(flat.copy())
                         # Update live level (exponential smoothing, no lock needed for float)
@@ -324,22 +337,22 @@ _LAST_WAV = Path(os.environ.get("TEMP", "C:/temp")) / "voice-input-last.wav"
 
 _WHISPER_RATE = 16000
 
-def audio_to_wav(audio_int16):
+def audio_to_wav(audio_int16, rate=SAMPLERATE):
     # Save full-rate copy for playback
     try:
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(SAMPLERATE)
+            wf.setframerate(rate)
             wf.writeframes(audio_int16.tobytes())
         _LAST_WAV.write_bytes(buf.getvalue())
     except Exception:
         pass
 
-    # Downsample to 16kHz for Whisper (3x smaller upload)
+    # Downsample to 16kHz for transcription (smaller upload)
     old_len = len(audio_int16)
-    new_len = int(old_len * _WHISPER_RATE / SAMPLERATE)
+    new_len = int(old_len * _WHISPER_RATE / rate)
     audio_16k = np.interp(
         np.linspace(0, old_len - 1, new_len),
         np.arange(old_len),
@@ -373,16 +386,14 @@ def api_transcribe_openai(api_key, wav_bytes, prompt="", language=""):
 
 
 def api_transcribe_deepgram(api_key, wav_bytes, language="", keywords=None):
-    params = {"model": "nova-2", "diarize": "false", "smart_format": "true"}
+    params = [("model", "nova-2"), ("diarize", "false"), ("smart_format", "true")]
     if language:
-        params["language"] = language
-    query = "&".join(f"{k}={httpx.URL.encode_value(str(v))}" for k, v in params.items())
+        params.append(("language", language))
     if keywords:
-        kw_query = "&".join(f"keywords={httpx.URL.encode_value(k)}" for k in keywords)
-        query = f"{kw_query}&{query}"
+        params += [("keywords", k) for k in keywords]
     with httpx.Client(timeout=_TIMEOUT) as client:
         resp = client.post(
-            f"https://api.deepgram.com/v1/listen?{query}",
+            "https://api.deepgram.com/v1/listen", params=params,
             headers={"Authorization": f"Token {api_key}", "Content-Type": "audio/wav"},
             content=wav_bytes,
         )
@@ -1287,16 +1298,17 @@ class TrayApp(QApplication):
 
     def _stop_and_process(self, long_mode):
         audio = self._recorder.stop()
+        rate  = self._recorder.sample_rate
         n = len(audio) if audio is not None else 0
-        min_n = int(SAMPLERATE * 0.1)   # 100ms minimum
-        log(f"stop recording  samples={n}  min_needed={min_n}")
+        min_n = int(rate * 0.1)   # 100ms minimum
+        log(f"stop recording  samples={n}  rate={rate}  min_needed={min_n}")
         if audio is None or n < min_n:
             log("too short — aborting")
             self._sig_error.emit()
             return
-        self._process(audio, long_mode)
+        self._process(audio, rate, long_mode)
 
-    def _process(self, audio, long_mode):
+    def _process(self, audio, rate, long_mode):
         try:
             peak = int(np.max(np.abs(audio)))
             rms  = int(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
@@ -1305,7 +1317,7 @@ class TrayApp(QApplication):
                 log("near-silent, aborting")
                 self._sig_error.emit()
                 return
-            wav   = audio_to_wav(audio)
+            wav   = audio_to_wav(audio, rate)
             cfg   = load_config()
             corr  = load_corrections()
             provider = cfg.get("TRANSCRIPTION_PROVIDER", "openai").lower().strip()
