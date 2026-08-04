@@ -1,4 +1,5 @@
 import sys, os, io, wave, math, threading, ctypes, re, time, faulthandler
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -368,6 +369,7 @@ def audio_to_wav(audio_int16, rate=SAMPLERATE):
     return buf.getvalue()
 
 _TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0)
+_CLEANUP_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
 
 def api_transcribe_openai(api_key, wav_bytes, prompt="", language=""):
     data = {"model": "gpt-4o-mini-transcribe", "response_format": "text"}
@@ -415,7 +417,7 @@ def api_cleanup(api_key, text, context=""):
     )
     if context:
         system += f"\n\nContext: {context}"
-    with httpx.Client(timeout=_TIMEOUT) as client:
+    with httpx.Client(timeout=_CLEANUP_TIMEOUT) as client:
         resp = client.post(
             "https://api.deepseek.com/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -1346,12 +1348,18 @@ class TrayApp(QApplication):
             final = raw
             ds = cfg.get("DEEPSEEK_API_KEY", "")
             if ds and len(raw.split()) >= MIN_WORDS_CLEANUP:
+                log("calling DeepSeek…")
+                ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                fut = ex.submit(api_cleanup, ds, raw, cfg.get("CONTEXT", ""))
                 try:
-                    log("calling DeepSeek…")
-                    final = api_cleanup(ds, raw, cfg.get("CONTEXT", ""))
+                    final = fut.result(timeout=20.0)
                     log(f"cleaned: {final[:80]!r}")
+                except concurrent.futures.TimeoutError:
+                    log("cleanup timed out after 20s — using raw transcript")
                 except Exception as e:
                     log(f"cleanup failed: {e}")
+                finally:
+                    ex.shutdown(wait=False)
             if corr:
                 final = apply_corrections(final, corr)
             save_to_notes(final)
