@@ -1,7 +1,8 @@
-import sys, os, io, wave, math, threading, ctypes, re, time, faulthandler
+import sys, os, io, wave, math, threading, ctypes, re, time, faulthandler, json
 import concurrent.futures
 from pathlib import Path
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 faulthandler.enable(open(
     Path(os.environ.get("TEMP","C:/temp")) / "voice-input-crash.txt", "w"
@@ -33,6 +34,11 @@ except ImportError as _e:
     _tk.Tk().withdraw()
     _mb.showerror("GoVoice", f"Missing dependency:\n{_e}\n\nRun: pip install sounddevice numpy httpx")
     sys.exit(1)
+
+try:
+    import websocket  # websocket-client — enables Deepgram live streaming (optional)
+except Exception:
+    websocket = None
 
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QDialog, QVBoxLayout,
@@ -191,6 +197,90 @@ def build_whisper_prompt(corrections):
         return ""
     return ", ".join(r for _, r in corrections[:20])
 
+# ── Deepgram live streaming ──────────────────────────────────────────────────
+class DeepgramStream:
+    """Live transcription over Deepgram's WebSocket. Feed mono int16 PCM frames
+    with send() as they are captured, then call finish() to flush and get the
+    full transcript. On any failure self.failed is set so the caller can fall
+    back to the batch (file-upload) path — nothing is lost, because the Recorder
+    also keeps accumulating the raw audio."""
+
+    def __init__(self, api_key, sample_rate, language="", keywords=None):
+        self.failed  = False
+        self._finals = []
+        self._lock   = threading.Lock()
+        self._ws     = None
+        self._closed = threading.Event()
+        if websocket is None:
+            self.failed = True
+            return
+        params = ["model=nova-2", "smart_format=true", "encoding=linear16",
+                  f"sample_rate={int(sample_rate)}", "channels=1",
+                  "interim_results=true"]
+        if language:
+            params.append("language=" + quote(language))
+        for k in (keywords or [])[:20]:
+            if k:
+                params.append("keywords=" + quote(k))
+        url = "wss://api.deepgram.com/v1/listen?" + "&".join(params)
+        try:
+            self._ws = websocket.create_connection(
+                url, header=[f"Authorization: Token {api_key}"], timeout=10)
+            threading.Thread(target=self._recv_loop, daemon=True).start()
+            log(f"deepgram stream open  rate={int(sample_rate)}")
+        except Exception as e:
+            log(f"deepgram stream connect failed: {e}")
+            self.failed = True
+
+    def _recv_loop(self):
+        try:
+            while True:
+                msg = self._ws.recv()
+                if not msg:
+                    break
+                data = json.loads(msg)
+                if data.get("type") == "Results":
+                    tr = data["channel"]["alternatives"][0].get("transcript", "")
+                    if data.get("is_final") and tr:
+                        with self._lock:
+                            self._finals.append(tr)
+                elif data.get("type") == "Metadata":
+                    break
+        except Exception as e:
+            log(f"deepgram stream recv ended: {e}")
+        finally:
+            self._closed.set()
+
+    def send(self, pcm_bytes):
+        if self.failed or self._ws is None:
+            return
+        try:
+            self._ws.send_binary(pcm_bytes)
+        except Exception as e:
+            log(f"deepgram stream send failed: {e}")
+            self.failed = True
+
+    def finish(self, timeout=8.0):
+        """Flush and return the full transcript, or None if streaming failed."""
+        if self.failed or self._ws is None:
+            return None
+        try:
+            self._ws.send(json.dumps({"type": "CloseStream"}))
+        except Exception:
+            pass
+        self._closed.wait(timeout)
+        self.close()
+        with self._lock:
+            return " ".join(self._finals).strip()
+
+    def close(self):
+        try:
+            if self._ws is not None:
+                self._ws.close()
+        except Exception:
+            pass
+        self._ws = None
+
 # ── Recorder ───────────────────────────────────────────────────────────────
 class Recorder:
     """Records via WASAPI in a background thread using blocking stream.read()."""
@@ -203,6 +293,8 @@ class Recorder:
         self._lock    = threading.Lock()
         self.level    = 0.0   # current RMS level 0.0–1.0, updated in real-time
         self.sample_rate = SAMPLERATE   # actual rate of the last-opened stream
+        self._stream_sink    = None     # live transcription sink for current recording
+        self._stream_factory = None
         self._wasapi  = self._find_wasapi_api()
 
     @staticmethod
@@ -211,6 +303,16 @@ class Recorder:
             if "WASAPI" in api["name"]:
                 return i
         return None
+
+    def _refresh_devices(self):
+        """Re-scan audio devices so hot-plugged mics and a changed Windows
+        default are picked up. Safe to call only when no stream is open."""
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+        self._wasapi = self._find_wasapi_api()
 
     def list_input_devices(self):
         """Return input device names available on WASAPI (falls back to all)."""
@@ -241,11 +343,15 @@ class Recorder:
                 return i
         return None
 
-    def start(self, device_name=None):
+    def start(self, device_name=None, stream_factory=None):
         if self._thread and self._thread.is_alive():
             self._running = False
             self._thread.join(timeout=1.0)
+        # No stream is open at this point — safe to rescan for device changes.
+        self._refresh_devices()
         self._chunks  = []
+        self._stream_sink    = None
+        self._stream_factory = stream_factory
         self._running = True
         device = self._resolve_device(device_name)
         api_name = sd.query_devices(device)["hostapi"] if device is not None else "?"
@@ -296,11 +402,20 @@ class Recorder:
                                      blocksize=self._CHUNK, latency=latency) as stream:
                     self.sample_rate = rate
                     log(f"audio stream open  device={dev}  rate={rate}  channels={channels}")
+                    if self._stream_factory is not None:
+                        try:
+                            self._stream_sink = self._stream_factory(rate)
+                        except Exception as e:
+                            log(f"stream_factory failed: {e}")
+                            self._stream_sink = None
                     while self._running:
                         data, _ = stream.read(self._CHUNK)
                         # First channel only — on echo-cancelling devices the
                         # second channel can be a far-end reference signal.
                         flat = np.ascontiguousarray(data[:, 0])
+                        sink = self._stream_sink
+                        if sink is not None:
+                            sink.send(flat.tobytes())
                         with self._lock:
                             self._chunks.append(flat.copy())
                         # Update live level (exponential smoothing, no lock needed for float)
@@ -324,12 +439,21 @@ class Recorder:
             return None
         return np.concatenate(chunks)
 
+    def get_stream_sink(self):
+        """The live transcription sink for the just-finished recording, or None."""
+        return self._stream_sink
+
     def cancel(self):
         self._running = False
         self.level = 0.0
         if self._thread:
             self._thread.join(timeout=1.0)
             self._thread = None
+        sink = self._stream_sink
+        if sink is not None:
+            try: sink.close()
+            except Exception: pass
+        self._stream_sink = None
         with self._lock:
             self._chunks = []
 
@@ -466,6 +590,10 @@ DARK_STYLE = """
         padding: 7px 11px; color: #d8d8f0; selection-background-color: #03DAC6;
     }
     QLineEdit:focus { border-color: #03DAC6; background: #1c1c30; }
+    QTableWidget QLineEdit {
+        padding: 0 5px; border-radius: 0; min-height: 0;
+        background: #20203a; color: #ffffff; border: 1px solid #03DAC6;
+    }
     QTableWidget {
         background: #14141e; border: 1px solid #202038; border-radius: 6px;
         gridline-color: #1c1c2e; color: #c0c0de; font-size: 9.5pt;
@@ -842,7 +970,7 @@ class SettingsDialog(DarkDialog):
 
         lay.addWidget(self._label("Microphone"))
         self.mic_combo = QComboBox()
-        self.mic_combo.addItem("Default (Windows setting)", "")
+        self.mic_combo.addItem("Follow Windows default (recommended)", "")
         current_dev = cfg.get("AUDIO_DEVICE", "")
         try:
             for name in Recorder().list_input_devices():
@@ -937,6 +1065,7 @@ class SettingsDialog(DarkDialog):
         t = QTableWidget(0, len(headers))
         t.setHorizontalHeaderLabels(headers)
         t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(30)
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         hh = t.horizontalHeader()
         if col_widths:
@@ -953,8 +1082,8 @@ class SettingsDialog(DarkDialog):
     def _table_btns(self, table):
         row = QHBoxLayout()
         row.setSpacing(6)
-        for label, fn in [("+ Add", lambda t=table: self._add_blank(t)),
-                          ("Remove", lambda t=table: self._del_row(t))]:
+        for label, fn in [("+ Add", lambda _checked=False, t=table: self._add_blank(t)),
+                          ("Remove", lambda _checked=False, t=table: self._del_row(t))]:
             b = QPushButton(label)
             b.setObjectName("ghost")
             b.clicked.connect(fn)
@@ -1147,7 +1276,7 @@ class HistoryDialog(DarkDialog):
 class TrayApp(QApplication):
     _sig_state = pyqtSignal(str)           # state for FloatingIcon (thread-safe)
     _sig_done  = pyqtSignal(str, str, bool) # display, full_text, do_paste
-    _sig_error = pyqtSignal()               # show error then return to idle
+    _sig_error = pyqtSignal(str)            # show error (with reason) then return to idle
 
     def __init__(self):
         log("TrayApp init start")
@@ -1254,11 +1383,22 @@ class TrayApp(QApplication):
         cfg = load_config()
         device = cfg.get("AUDIO_DEVICE") or None
         log(f"start recording  device={device!r}  long={long}")
+        # Live-streaming transcription (Deepgram only) — the transcript is ready
+        # almost as soon as you stop. Falls back to a batch upload if the socket
+        # can't be opened or drops out mid-recording.
+        stream_factory = None
+        provider = cfg.get("TRANSCRIPTION_PROVIDER", "openai").lower().strip()
+        if provider == "deepgram" and websocket is not None:
+            dg_key = cfg.get("DEEPGRAM_API_KEY", "")
+            if dg_key:
+                dg_lang = cfg.get("LANGUAGE", "")
+                dg_kw   = [r for _, r in load_corrections()[:20]]
+                stream_factory = lambda rate: DeepgramStream(dg_key, rate, dg_lang, dg_kw)
         try:
-            self._recorder.start(device_name=device)
+            self._recorder.start(device_name=device, stream_factory=stream_factory)
         except Exception as e:
             log(f"recorder.start failed: {e}")
-            self._on_error()
+            self._on_error("Couldn't open microphone — check it's connected and selected in Settings")
             return
         self._long_mode = long
         self.recording  = True
@@ -1299,51 +1439,69 @@ class TrayApp(QApplication):
     # ── Processing (background thread) ────────────────────────────────────
 
     def _stop_and_process(self, long_mode):
-        audio = self._recorder.stop()
+        stream = self._recorder.get_stream_sink()
+        audio = self._recorder.stop()   # joins the capture thread — sends have ceased
         rate  = self._recorder.sample_rate
         n = len(audio) if audio is not None else 0
         min_n = int(rate * 0.1)   # 100ms minimum
         log(f"stop recording  samples={n}  rate={rate}  min_needed={min_n}")
         if audio is None or n < min_n:
             log("too short — aborting")
-            self._sig_error.emit()
+            if stream is not None:
+                try: stream.close()
+                except Exception: pass
+            self._sig_error.emit("Recording too short — hold the hotkey a moment longer")
             return
-        self._process(audio, rate, long_mode)
+        # If we streamed, flush the socket for the (near-instant) final transcript.
+        # None → streaming failed, so _process falls back to a batch upload.
+        streamed_text = None
+        if stream is not None:
+            t0 = time.time()
+            streamed_text = stream.finish()
+            log(f"stream finish  {time.time()-t0:.2f}s  text={(streamed_text or '')[:60]!r}")
+            if not streamed_text:
+                streamed_text = None
+        self._process(audio, rate, long_mode, streamed_text)
 
-    def _process(self, audio, rate, long_mode):
+    def _process(self, audio, rate, long_mode, streamed_text=None):
         try:
             peak = int(np.max(np.abs(audio)))
             rms  = int(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
             log(f"process  samples={len(audio)}  peak={peak}  rms={rms}")
             if peak < SILENCE_PEAK or rms < 100:
                 log("near-silent, aborting")
-                self._sig_error.emit()
+                self._sig_error.emit("No sound detected — check the right microphone is selected in Settings")
                 return
-            wav   = audio_to_wav(audio, rate)
             cfg   = load_config()
             corr  = load_corrections()
-            provider = cfg.get("TRANSCRIPTION_PROVIDER", "openai").lower().strip()
-            if provider == "deepgram":
-                key = cfg.get("DEEPGRAM_API_KEY", "")
-                prompt = ""
-                keywords = [r for _, r in corr[:20]]
+            if streamed_text is not None:
+                # Live streaming already produced the transcript — no upload needed.
+                raw = streamed_text
+                log(f"stream transcript: {raw[:80]!r}")
             else:
-                key = cfg.get("OPENAI_API_KEY", "")
-                prompt = build_whisper_prompt(corr)
-                keywords = None
-            if not key:
-                log(f"missing {provider} key")
-                self._sig_error.emit()
-                return
-            log(f"calling {provider}…")
-            raw = api_transcribe(provider, key, wav,
-                                 prompt=prompt,
-                                 language=cfg.get("LANGUAGE", ""),
-                                 keywords=keywords)
-            log(f"transcript: {raw[:80]!r}")
+                wav   = audio_to_wav(audio, rate)
+                provider = cfg.get("TRANSCRIPTION_PROVIDER", "openai").lower().strip()
+                if provider == "deepgram":
+                    key = cfg.get("DEEPGRAM_API_KEY", "")
+                    prompt = ""
+                    keywords = [r for _, r in corr[:20]]
+                else:
+                    key = cfg.get("OPENAI_API_KEY", "")
+                    prompt = build_whisper_prompt(corr)
+                    keywords = None
+                if not key:
+                    log(f"missing {provider} key")
+                    self._sig_error.emit(f"Missing {provider.title()} API key — add it in Settings")
+                    return
+                log(f"calling {provider}…")
+                raw = api_transcribe(provider, key, wav,
+                                     prompt=prompt,
+                                     language=cfg.get("LANGUAGE", ""),
+                                     keywords=keywords)
+                log(f"transcript: {raw[:80]!r}")
             if not raw:
                 log("empty transcript — wrong mic, or no speech detected")
-                self._sig_error.emit()
+                self._sig_error.emit("No speech detected — try a different microphone in Settings")
                 return
             final = raw
             ds = cfg.get("DEEPSEEK_API_KEY", "")
@@ -1368,7 +1526,7 @@ class TrayApp(QApplication):
             self._sig_done.emit(final[:80] + ("…" if len(final) > 80 else ""), final, do_paste)
         except Exception as e:
             log(f"process exception: {e}")
-            self._sig_error.emit()
+            self._sig_error.emit(f"Transcription failed: {str(e)[:80]}")
 
     # ── Result handlers (main thread) ─────────────────────────────────────
 
@@ -1379,8 +1537,16 @@ class TrayApp(QApplication):
             QTimer.singleShot(80, paste_clipboard)
         QTimer.singleShot(3500, lambda: self.float_icon.set_state(FloatingIcon.IDLE))
 
-    def _on_error(self):
+    def _on_error(self, reason=""):
         self.float_icon.set_state(FloatingIcon.ERROR)
+        if reason:
+            log(f"error shown: {reason}")
+            self.float_icon.setToolTip(f"GoVoice — {reason}")
+            try:
+                self.tray.showMessage("GoVoice", reason,
+                                      QSystemTrayIcon.MessageIcon.Warning, 4000)
+            except Exception:
+                pass
         QTimer.singleShot(3500, lambda: self.float_icon.set_state(FloatingIcon.IDLE))
 
     # ── Helpers ────────────────────────────────────────────────────────────
