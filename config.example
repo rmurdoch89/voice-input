@@ -7,6 +7,8 @@ DEEPGRAM_API_KEY=your-deepgram-key-here
 
 # Optional: AI cleanup of grammar and punctuation
 DEEPSEEK_API_KEY=your-deepseek-key-here
+# Seconds to wait for the cleanup before pasting the raw transcript (default 4)
+#CLEANUP_TIMEOUT=4
 
 # Context used to improve transcription accuracy and guide cleanup
 CONTEXT=Describe yourself here — role, tools, project names, tech stack. Used to improve transcription accuracy.

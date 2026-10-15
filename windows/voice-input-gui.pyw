@@ -1509,11 +1509,17 @@ class TrayApp(QApplication):
                 log("calling DeepSeek…")
                 ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 fut = ex.submit(api_cleanup, ds, raw, cfg.get("CONTEXT", ""))
+                # DeepSeek can take 20-40s on a bad day; don't make the user wait for it.
+                # Paste the raw transcript after CLEANUP_TIMEOUT seconds (config, default 4).
                 try:
-                    final = fut.result(timeout=20.0)
+                    wait = float(cfg.get("CLEANUP_TIMEOUT", "") or 4)
+                except ValueError:
+                    wait = 4.0
+                try:
+                    final = fut.result(timeout=wait)
                     log(f"cleaned: {final[:80]!r}")
                 except concurrent.futures.TimeoutError:
-                    log("cleanup timed out after 20s — using raw transcript")
+                    log(f"cleanup timed out after {wait:g}s — using raw transcript")
                 except Exception as e:
                     log(f"cleanup failed: {e}")
                 finally:
